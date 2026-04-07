@@ -93,6 +93,30 @@ function getClients(): { openai: OpenAI; anthropic: Anthropic } {
   };
 }
 
+// ─── Retry helper for 429 rate-limit errors ───────────────────────────────────
+// Waits with exponential back-off then retries. Gives up after MAX_RETRIES.
+const MAX_RETRIES = 4;
+const BASE_DELAY_MS = 2000; // 2 s → 4 s → 8 s → 16 s
+
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err: unknown) {
+      const status = (err as Record<string, unknown>)?.status as number | undefined;
+      if (status === 429 && attempt < MAX_RETRIES) {
+        const delay = BASE_DELAY_MS * Math.pow(2, attempt);
+        console.warn(`[proxy] 429 rate-limit hit, retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+        await new Promise((r) => setTimeout(r, delay));
+        attempt++;
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 const OPENAI_MODELS = [
   { id: "gpt-5.2", provider: "openai" },
   { id: "gpt-5-mini", provider: "openai" },
@@ -715,6 +739,15 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
       };
 
       if (stream) {
+        // Create the stream BEFORE setting SSE headers so 429s can be retried.
+        const oaiStream = await withRetry(() =>
+          openai.chat.completions.create({
+            ...params,
+            stream: true,
+            stream_options: { include_usage: true },
+          })
+        );
+
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
         res.setHeader("Connection", "keep-alive");
@@ -729,11 +762,6 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
         }, 5000);
 
         try {
-          const oaiStream = await openai.chat.completions.create({
-            ...params,
-            stream: true,
-            stream_options: { include_usage: true },
-          });
           for await (const chunk of oaiStream) {
             res.write(`data: ${JSON.stringify(chunk)}\n\n`);
             if ("flush" in res && typeof (res as unknown as { flush: () => void }).flush === "function") {
@@ -749,7 +777,7 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
       }
 
       // Non-stream OpenAI
-      const response = await openai.chat.completions.create({ ...params, stream: false });
+      const response = await withRetry(() => openai.chat.completions.create({ ...params, stream: false }));
       res.json(response);
       return;
     }
@@ -775,6 +803,12 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
       });
 
       if (stream) {
+        // Create the stream BEFORE setting SSE headers so 429s can be retried
+        // without leaving the client with a broken half-open SSE connection.
+        const anthropicStream = await withRetry(() =>
+          anthropic.messages.create({ ...anthropicParams, stream: true })
+        );
+
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
         res.setHeader("Connection", "keep-alive");
@@ -814,7 +848,6 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
         };
 
         try {
-          const anthropicStream = anthropic.messages.stream(anthropicParams);
 
           for await (const event of anthropicStream) {
             if (event.type === "message_start") {
@@ -879,7 +912,7 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
       }
 
       // Non-stream Anthropic — use stream().finalMessage() to avoid timeouts
-      const finalMsg = await anthropic.messages.stream(anthropicParams).finalMessage();
+      const finalMsg = await withRetry(() => anthropic.messages.stream(anthropicParams).finalMessage());
       res.json(anthropicResponseToOpenAI(finalMsg, model));
       return;
     }
@@ -935,6 +968,11 @@ router.post("/messages", async (req: Request, res: Response) => {
       });
 
       if (stream) {
+        // Create the stream BEFORE setting SSE headers so 429s can be retried.
+        const anthropicStream = await withRetry(() =>
+          anthropic.messages.create({ ...params, stream: true })
+        );
+
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
         res.setHeader("Connection", "keep-alive");
@@ -955,7 +993,6 @@ router.post("/messages", async (req: Request, res: Response) => {
         };
 
         try {
-          const anthropicStream = anthropic.messages.stream(params);
           for await (const event of anthropicStream) {
             res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
             flush();
@@ -968,7 +1005,7 @@ router.post("/messages", async (req: Request, res: Response) => {
       }
 
       // Non-stream
-      const msg = await anthropic.messages.stream(params).finalMessage();
+      const msg = await withRetry(() => anthropic.messages.stream(params).finalMessage());
       res.json(msg);
       return;
     }
@@ -996,6 +1033,15 @@ router.post("/messages", async (req: Request, res: Response) => {
       };
 
       if (stream) {
+        // Create the stream BEFORE setting SSE headers so 429s can be retried.
+        const oaiStream = await withRetry(() =>
+          openai.chat.completions.create({
+            ...params,
+            stream: true,
+            stream_options: { include_usage: true },
+          })
+        );
+
         res.setHeader("Content-Type", "text/event-stream");
         res.setHeader("Cache-Control", "no-cache");
         res.setHeader("Connection", "keep-alive");
@@ -1033,11 +1079,6 @@ router.post("/messages", async (req: Request, res: Response) => {
         };
 
         try {
-          const oaiStream = await openai.chat.completions.create({
-            ...params,
-            stream: true,
-            stream_options: { include_usage: true },
-          });
 
           for await (const chunk of oaiStream) {
             if (!sentMessageStart) {
@@ -1140,7 +1181,7 @@ router.post("/messages", async (req: Request, res: Response) => {
       }
 
       // Non-stream: OpenAI → Anthropic format
-      const response = await openai.chat.completions.create({ ...params, stream: false });
+      const response = await withRetry(() => openai.chat.completions.create({ ...params, stream: false }));
       res.json(openaiResponseToAnthropic(response, model));
       return;
     }
