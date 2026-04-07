@@ -134,8 +134,12 @@ const ANTHROPIC_MODELS = [
 const ALL_MODELS = [...OPENAI_MODELS, ...ANTHROPIC_MODELS];
 
 function verifyBearer(req: Request, res: Response): boolean {
+  // Accept both OpenAI-style "Authorization: Bearer <key>"
+  // and Anthropic-style "x-api-key: <key>" so native Anthropic clients work too.
   const authHeader = req.headers["authorization"] ?? "";
-  const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+  const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : "";
+  const xApiKey = (req.headers["x-api-key"] as string | undefined) ?? "";
+  const token = bearerToken || xApiKey;
   if (!token || token !== process.env.PROXY_API_KEY) {
     res.status(401).json({ error: { message: "Unauthorized", type: "invalid_request_error", code: "invalid_api_key" } });
     return false;
