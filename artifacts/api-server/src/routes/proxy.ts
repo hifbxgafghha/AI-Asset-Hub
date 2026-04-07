@@ -202,6 +202,59 @@ function anthropicToolChoiceToOpenAI(
 
 type AnyMessage = Record<string, unknown>;
 
+// Normalize an OpenAI content value to a plain string.
+// OpenAI allows content to be either a string or an array of content parts
+// e.g. [{type:"text",text:"..."}]. Anthropic's system prompt is always a string.
+function normalizeContentToString(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object") {
+          const p = part as Record<string, unknown>;
+          if (p.type === "text" && typeof p.text === "string") return p.text;
+        }
+        return "";
+      })
+      .join("");
+  }
+  return String(content ?? "");
+}
+
+// Convert OpenAI content (string | ContentPart[]) to an Anthropic content array.
+// Keeps image_url blocks as Anthropic image blocks where possible.
+function normalizeContentToAnthropic(content: unknown): Anthropic.MessageParam["content"] {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const blocks: Anthropic.ContentBlockParam[] = [];
+    for (const part of content) {
+      if (typeof part === "string") {
+        blocks.push({ type: "text", text: part });
+        continue;
+      }
+      if (part && typeof part === "object") {
+        const p = part as Record<string, unknown>;
+        if (p.type === "text") {
+          blocks.push({ type: "text", text: (p.text as string) ?? "" });
+        } else if (p.type === "image_url" && p.image_url) {
+          const iu = p.image_url as Record<string, unknown>;
+          const url = iu.url as string ?? "";
+          if (url.startsWith("data:")) {
+            const [header, data] = url.split(",");
+            const mediaType = (header.split(":")[1]?.split(";")[0] ?? "image/jpeg") as Anthropic.Base64ImageSource["media_type"];
+            blocks.push({ type: "image", source: { type: "base64", media_type: mediaType, data } });
+          } else {
+            blocks.push({ type: "text", text: `[image: ${url}]` });
+          }
+        }
+      }
+    }
+    return blocks;
+  }
+  return String(content ?? "");
+}
+
 function openaiMessagesToAnthropic(
   messages: AnyMessage[],
 ): { system?: string; messages: Anthropic.MessageParam[] } {
@@ -211,11 +264,13 @@ function openaiMessagesToAnthropic(
   for (const msg of messages) {
     const role = msg.role as string;
     if (role === "system") {
-      system = msg.content as string;
+      // Accumulate multiple system messages, separated by double newline
+      const text = normalizeContentToString(msg.content);
+      system = system ? `${system}\n\n${text}` : text;
       continue;
     }
     if (role === "user") {
-      converted.push({ role: "user", content: msg.content as string });
+      converted.push({ role: "user", content: normalizeContentToAnthropic(msg.content) });
       continue;
     }
     if (role === "assistant") {
@@ -227,7 +282,7 @@ function openaiMessagesToAnthropic(
       if (toolCalls && toolCalls.length > 0) {
         const content: Anthropic.ContentBlock[] = [];
         if (msg.content) {
-          content.push({ type: "text", text: msg.content as string });
+          content.push({ type: "text", text: normalizeContentToString(msg.content) });
         }
         for (const tc of toolCalls) {
           let input: Record<string, unknown> = {};
@@ -641,7 +696,9 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
   const messages = (body.messages as AnyMessage[]) ?? [];
   const tools = body.tools as OpenAITool[] | undefined;
   const toolChoice = body.tool_choice;
-  const maxTokens = (body.max_tokens as number | undefined) ?? 8192;
+  const maxTokens = (body.max_completion_tokens as number | undefined)
+    ?? (body.max_tokens as number | undefined)
+    ?? 8192;
 
   try {
     // ── OpenAI path ──
@@ -672,7 +729,11 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
         }, 5000);
 
         try {
-          const oaiStream = await openai.chat.completions.create({ ...params, stream: true });
+          const oaiStream = await openai.chat.completions.create({
+            ...params,
+            stream: true,
+            stream_options: { include_usage: true },
+          });
           for await (const chunk of oaiStream) {
             res.write(`data: ${JSON.stringify(chunk)}\n\n`);
             if ("flush" in res && typeof (res as unknown as { flush: () => void }).flush === "function") {
@@ -848,7 +909,9 @@ router.post("/messages", async (req: Request, res: Response) => {
   const system = body.system as string | Anthropic.TextBlockParam[] | undefined;
   const tools = body.tools as AnthropicTool[] | undefined;
   const toolChoice = body.tool_choice;
-  const maxTokens = (body.max_tokens as number | undefined) ?? 8192;
+  const maxTokens = (body.max_completion_tokens as number | undefined)
+    ?? (body.max_tokens as number | undefined)
+    ?? 8192;
 
   try {
     // ── Claude model → direct Anthropic ──
@@ -960,6 +1023,9 @@ router.post("/messages", async (req: Request, res: Response) => {
         let currentToolId = "";
         let currentToolName = "";
         let currentToolInput = "";
+        // Defer message_delta/message_stop until after the loop so we can include
+        // the final usage from the trailing usage-only chunk (stream_options.include_usage).
+        let pendingStopReason: string | null = null;
 
         const sendEvent = (type: string, data: Record<string, unknown>) => {
           res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -967,7 +1033,11 @@ router.post("/messages", async (req: Request, res: Response) => {
         };
 
         try {
-          const oaiStream = await openai.chat.completions.create({ ...params, stream: true });
+          const oaiStream = await openai.chat.completions.create({
+            ...params,
+            stream: true,
+            stream_options: { include_usage: true },
+          });
 
           for await (const chunk of oaiStream) {
             if (!sentMessageStart) {
@@ -1042,19 +1112,25 @@ router.post("/messages", async (req: Request, res: Response) => {
               if (currentIndex >= 0) {
                 sendEvent("content_block_stop", { type: "content_block_stop", index: currentIndex });
               }
-              const stopReason = finishReason === "tool_calls" ? "tool_use" : "end_turn";
-              sendEvent("message_delta", {
-                type: "message_delta",
-                delta: { stop_reason: stopReason, stop_sequence: null },
-                usage: { output_tokens: outputTokens },
-              });
-              sendEvent("message_stop", { type: "message_stop" });
+              // Record stop reason but defer message_delta/message_stop until after the loop
+              // so we can include the final usage from the trailing usage-only chunk.
+              pendingStopReason = finishReason === "tool_calls" ? "tool_use" : "end_turn";
             }
 
             if (chunk.usage) {
               inputTokens = chunk.usage.prompt_tokens ?? 0;
               outputTokens = chunk.usage.completion_tokens ?? 0;
             }
+          }
+
+          // Send final message_delta and message_stop now that we have complete usage data
+          if (pendingStopReason) {
+            sendEvent("message_delta", {
+              type: "message_delta",
+              delta: { stop_reason: pendingStopReason, stop_sequence: null },
+              usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+            });
+            sendEvent("message_stop", { type: "message_stop" });
           }
         } finally {
           clearInterval(keepalive);
