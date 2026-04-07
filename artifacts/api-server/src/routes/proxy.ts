@@ -76,7 +76,9 @@ function isAnthropicModel(model: string): boolean {
 }
 
 function isOpenAIModel(model: string): boolean {
-  return model.startsWith("gpt-") || model.startsWith("o");
+  // Match gpt-* and o-series reasoning models (o1, o3, o4-mini, etc.) only.
+  // Use a tighter check for "o" models to avoid misrouting unrelated model names.
+  return model.startsWith("gpt-") || /^o\d/.test(model);
 }
 
 // ─── Tool format conversion helpers ───────────────────────────────────────────
@@ -291,6 +293,18 @@ function anthropicMessagesToOpenAI(messages: AnyMessage[]): AnyMessage[] {
 
 type CacheControl = { type: "ephemeral" };
 
+// Anthropic's minimum cacheable content: 1024 tokens for Haiku, 2048 for others.
+// 1 token ≈ 4 chars. Use 1024 tokens (4096 chars) as the universal floor so we
+// never pay a cache-write surcharge on content that Anthropic won't actually cache.
+const MIN_CACHE_CHARS = 4096;
+
+function blockTextLength(block: Record<string, unknown>): number {
+  if (typeof block.text === "string") return block.text.length;
+  if (typeof block.thinking === "string") return block.thinking.length;
+  if (typeof block.content === "string") return block.content.length;
+  return 0;
+}
+
 function addCacheControl<T extends Record<string, unknown>>(block: T): T {
   if ((block as Record<string, unknown>).cache_control) return block;
   return { ...block, cache_control: { type: "ephemeral" } as CacheControl };
@@ -342,14 +356,22 @@ function applyPromptCaching(
     // Already has cache_control — pass through unchanged
     cachedSystem = system as Anthropic.TextBlockParam[];
   } else if (pointsUsed < MAX_CACHE_POINTS) {
-    if (typeof system === "string") {
-      cachedSystem = [{ type: "text", text: system, cache_control: { type: "ephemeral" } }];
+    const systemText = typeof system === "string" ? system : system.map((b) => b.text).join("");
+    if (systemText.length >= MIN_CACHE_CHARS) {
+      if (typeof system === "string") {
+        cachedSystem = [{ type: "text", text: system, cache_control: { type: "ephemeral" } }];
+      } else {
+        const arr = [...system];
+        arr[arr.length - 1] = addCacheControl(arr[arr.length - 1] as Record<string, unknown>) as Anthropic.TextBlockParam;
+        cachedSystem = arr;
+      }
+      pointsUsed++;
     } else {
-      const arr = [...system];
-      arr[arr.length - 1] = addCacheControl(arr[arr.length - 1] as Record<string, unknown>) as Anthropic.TextBlockParam;
-      cachedSystem = arr;
+      // System prompt too short to be cacheable — don't waste a write surcharge
+      cachedSystem = typeof system === "string"
+        ? [{ type: "text", text: system }]
+        : (system as Anthropic.TextBlockParam[]);
     }
-    pointsUsed++;
   } else {
     // No budget left — pass system through as array without adding cache_control
     cachedSystem = typeof system === "string"
@@ -376,12 +398,17 @@ function applyPromptCaching(
     if (!indicesToCache.has(i)) return msg;
     const content = msg.content;
     if (typeof content === "string") {
+      // Only cache if content is long enough to meet Anthropic's minimum threshold
+      if (content.length < MIN_CACHE_CHARS) return msg;
       return {
         ...msg,
         content: [addCacheControl({ type: "text" as const, text: content })],
       };
     }
     if (Array.isArray(content) && content.length > 0) {
+      const lastBlock = content[content.length - 1] as Record<string, unknown>;
+      // Only cache if the last block has enough content to meet the minimum threshold
+      if (blockTextLength(lastBlock) < MIN_CACHE_CHARS) return msg;
       const arr = [...content] as Array<Record<string, unknown>>;
       arr[arr.length - 1] = addCacheControl(arr[arr.length - 1]);
       return { ...msg, content: arr as Anthropic.MessageParam["content"] };
@@ -780,7 +807,11 @@ router.post("/messages", async (req: Request, res: Response) => {
     if (isOpenAIModel(model)) {
       const openaiMessages = anthropicMessagesToOpenAI(messages);
       if (system) {
-        openaiMessages.unshift({ role: "system", content: system });
+        // OpenAI system messages require a plain string, not an array of content blocks
+        const systemContent = Array.isArray(system)
+          ? system.map((b) => b.text).join("\n\n")
+          : system;
+        openaiMessages.unshift({ role: "system", content: systemContent });
       }
       const openaiTools = tools ? tools.map(anthropicToolToOpenAI) : undefined;
       const openaiToolChoice = anthropicToolChoiceToOpenAI(toolChoice);
