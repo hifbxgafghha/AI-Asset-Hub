@@ -357,16 +357,18 @@ function applyPromptCaching(
       : (system as Anthropic.TextBlockParam[]);
   }
 
-  // Cache up to remaining budget from message history (skip last 2 = current exchange)
+  // Cache up to remaining budget from message history (skip only the new user turn at the end)
+  // messages = [...history, new_user_turn], so candidates are indices 0..length-2
   const remainingPoints = MAX_CACHE_POINTS - pointsUsed;
-  const cacheUpTo = Math.max(0, messages.length - 2);
+  const cacheUpTo = Math.max(0, messages.length - 1);
 
+  // Prefer the most recent messages (tail of history) — they're closest to the current turn
+  // and most likely to be a reusable cache prefix on the next request.
   const indicesToCache = new Set<number>();
   if (remainingPoints > 0 && cacheUpTo > 0) {
     const count = Math.min(remainingPoints, cacheUpTo);
     for (let k = 0; k < count; k++) {
-      const idx = cacheUpTo - 1 - Math.floor((k * cacheUpTo) / count);
-      indicesToCache.add(idx);
+      indicesToCache.add(cacheUpTo - 1 - k);
     }
   }
 
