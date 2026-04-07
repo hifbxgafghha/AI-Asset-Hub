@@ -4,46 +4,94 @@ import Anthropic from "@anthropic-ai/sdk";
 
 const router: IRouter = Router();
 
-// ─── Client initialisation (Replit AI Integrations only) ─────────────────────
-// This proxy requires Replit AI Integrations.
-// Enable them via: Replit → Tools → Integrations → OpenAI / Anthropic
-// The AI_INTEGRATIONS_* environment variables are provisioned automatically.
-
-if (!process.env.AI_INTEGRATIONS_OPENAI_API_KEY) {
-  console.error(
-    "[proxy] FATAL: AI_INTEGRATIONS_OPENAI_API_KEY is not set.\n" +
-    "  → Go to Replit → Tools → Integrations and enable the OpenAI integration.",
-  );
-  process.exit(1);
-}
-
-if (!process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY) {
-  console.error(
-    "[proxy] FATAL: AI_INTEGRATIONS_ANTHROPIC_API_KEY is not set.\n" +
-    "  → Go to Replit → Tools → Integrations and enable the Anthropic integration.",
-  );
-  process.exit(1);
-}
+// ─── Multi-account client pool with round-robin ───────────────────────────────
+//
+// Supports two credential sources (can mix and match):
+//
+// 1. Replit AI Integrations (on Replit):
+//    AI_INTEGRATIONS_OPENAI_BASE_URL / AI_INTEGRATIONS_OPENAI_API_KEY
+//    AI_INTEGRATIONS_ANTHROPIC_BASE_URL / AI_INTEGRATIONS_ANTHROPIC_API_KEY
+//
+// 2. Direct API keys (own server or additional accounts):
+//    OPENAI_API_KEY, OPENAI_API_KEY_2, OPENAI_API_KEY_3, ...
+//    ANTHROPIC_API_KEY, ANTHROPIC_API_KEY_2, ANTHROPIC_API_KEY_3, ...
+//
+// All configured clients are pooled and requests are distributed round-robin
+// so multiple accounts share the load automatically.
 
 if (!process.env.PROXY_API_KEY) {
   console.error(
     "[proxy] FATAL: PROXY_API_KEY is not set.\n" +
-    "  → Go to Replit → Tools → Secrets and add PROXY_API_KEY with any value you choose.",
+    "  → On Replit: Tools → Secrets → add PROXY_API_KEY.\n" +
+    "  → On your server: set the PROXY_API_KEY environment variable.",
   );
   process.exit(1);
 }
 
-const openai = new OpenAI({
-  baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
-  apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
-});
+const openaiPool: OpenAI[] = [];
 
-const anthropic = new Anthropic({
-  baseURL: process.env.AI_INTEGRATIONS_ANTHROPIC_BASE_URL,
-  apiKey: process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY,
-});
+// Replit AI Integrations slot
+if (process.env.AI_INTEGRATIONS_OPENAI_BASE_URL && process.env.AI_INTEGRATIONS_OPENAI_API_KEY) {
+  openaiPool.push(new OpenAI({
+    baseURL: process.env.AI_INTEGRATIONS_OPENAI_BASE_URL,
+    apiKey: process.env.AI_INTEGRATIONS_OPENAI_API_KEY,
+  }));
+}
 
-console.log("[proxy] Replit AI Integrations ready (OpenAI + Anthropic)");
+// Direct API keys: OPENAI_API_KEY, OPENAI_API_KEY_2, OPENAI_API_KEY_3, …
+for (const varName of ["OPENAI_API_KEY", ...Array.from({ length: 9 }, (_, i) => `OPENAI_API_KEY_${i + 2}`)]) {
+  const key = process.env[varName];
+  if (key) openaiPool.push(new OpenAI({ apiKey: key }));
+}
+
+if (openaiPool.length === 0) {
+  console.error(
+    "[proxy] FATAL: No OpenAI credentials found.\n" +
+    "  → On Replit: Tools → Integrations → enable OpenAI.\n" +
+    "  → On your server: set OPENAI_API_KEY (and optionally OPENAI_API_KEY_2, etc.).",
+  );
+  process.exit(1);
+}
+
+const anthropicPool: Anthropic[] = [];
+
+// Replit AI Integrations slot
+if (process.env.AI_INTEGRATIONS_ANTHROPIC_BASE_URL && process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY) {
+  anthropicPool.push(new Anthropic({
+    baseURL: process.env.AI_INTEGRATIONS_ANTHROPIC_BASE_URL,
+    apiKey: process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY,
+  }));
+}
+
+// Direct API keys: ANTHROPIC_API_KEY, ANTHROPIC_API_KEY_2, ANTHROPIC_API_KEY_3, …
+for (const varName of ["ANTHROPIC_API_KEY", ...Array.from({ length: 9 }, (_, i) => `ANTHROPIC_API_KEY_${i + 2}`)]) {
+  const key = process.env[varName];
+  if (key) anthropicPool.push(new Anthropic({ apiKey: key }));
+}
+
+if (anthropicPool.length === 0) {
+  console.error(
+    "[proxy] FATAL: No Anthropic credentials found.\n" +
+    "  → On Replit: Tools → Integrations → enable Anthropic.\n" +
+    "  → On your server: set ANTHROPIC_API_KEY (and optionally ANTHROPIC_API_KEY_2, etc.).",
+  );
+  process.exit(1);
+}
+
+console.log(
+  `[proxy] Ready — OpenAI: ${openaiPool.length} account(s), Anthropic: ${anthropicPool.length} account(s)`,
+);
+
+// Round-robin counter — advances once per incoming request
+let rrCounter = 0;
+function getClients(): { openai: OpenAI; anthropic: Anthropic } {
+  const idx = rrCounter++;
+  if (rrCounter >= 1_000_000) rrCounter = 0;
+  return {
+    openai: openaiPool[idx % openaiPool.length],
+    anthropic: anthropicPool[idx % anthropicPool.length],
+  };
+}
 
 const OPENAI_MODELS = [
   { id: "gpt-5.2", provider: "openai" },
@@ -419,6 +467,40 @@ function applyPromptCaching(
   return { system: cachedSystem, messages: cachedMessages };
 }
 
+// ─── Strip unsupported cache_control fields ───────────────────────────────────
+// Anthropic SDK v0.82+ automatically injects a `scope` field inside
+// cache_control objects, but Replit's Anthropic proxy rejects it.
+// Strip `scope` (and any other unrecognised keys) before every Anthropic call.
+
+function stripCacheControlScope(block: Record<string, unknown>): Record<string, unknown> {
+  if (!block.cache_control || typeof block.cache_control !== "object") return block;
+  const { scope: _scope, ...rest } = block.cache_control as Record<string, unknown>;
+  return { ...block, cache_control: rest };
+}
+
+function stripScopeFromAnthropicParams(params: Anthropic.MessageCreateParams): Anthropic.MessageCreateParams {
+  const system = params.system;
+  const cleanSystem = Array.isArray(system)
+    ? system.map((b) => stripCacheControlScope(b as Record<string, unknown>) as Anthropic.TextBlockParam)
+    : system;
+
+  const cleanMessages = params.messages.map((msg) => {
+    const content = msg.content;
+    if (typeof content === "string") return msg;
+    if (Array.isArray(content)) {
+      return {
+        ...msg,
+        content: content.map((block) =>
+          stripCacheControlScope(block as Record<string, unknown>)
+        ) as Anthropic.MessageParam["content"],
+      };
+    }
+    return msg;
+  });
+
+  return { ...params, ...(cleanSystem !== undefined ? { system: cleanSystem } : {}), messages: cleanMessages };
+}
+
 // ─── Response conversion helpers ─────────────────────────────────────────────
 
 function anthropicResponseToOpenAI(
@@ -536,6 +618,7 @@ router.get("/models", (req, res) => {
 
 router.post("/chat/completions", async (req: Request, res: Response) => {
   if (!verifyBearer(req, res)) return;
+  const { openai, anthropic } = getClients();
 
   const body = req.body as Record<string, unknown>;
   const model = (body.model as string) ?? "gpt-5.2";
@@ -605,7 +688,7 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
       const { system: cachedSystem, messages: anthropicMessages } = applyPromptCaching(rawSystem, rawAnthropicMessages);
 
       const thinking = body.thinking as Anthropic.MessageCreateParams["thinking"] | undefined;
-      const anthropicParams: Anthropic.MessageCreateParams = {
+      const anthropicParams: Anthropic.MessageCreateParams = stripScopeFromAnthropicParams({
         model,
         max_tokens: maxTokens,
         messages: anthropicMessages,
@@ -613,7 +696,7 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
         ...(anthropicTools ? { tools: anthropicTools } : {}),
         ...(anthropicToolChoice ? { tool_choice: anthropicToolChoice } : {}),
         ...(thinking ? { thinking } : {}),
-      };
+      });
 
       if (stream) {
         res.setHeader("Content-Type", "text/event-stream");
@@ -733,6 +816,7 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
 
 router.post("/messages", async (req: Request, res: Response) => {
   if (!verifyBearer(req, res)) return;
+  const { openai, anthropic } = getClients();
 
   const body = req.body as Record<string, unknown>;
   const model = (body.model as string) ?? "claude-sonnet-4-6";
@@ -754,7 +838,7 @@ router.post("/messages", async (req: Request, res: Response) => {
         messages as Anthropic.MessageParam[],
       );
 
-      const params: Anthropic.MessageCreateParams = {
+      const params: Anthropic.MessageCreateParams = stripScopeFromAnthropicParams({
         model,
         max_tokens: maxTokens,
         messages: cachedMessages,
@@ -762,7 +846,7 @@ router.post("/messages", async (req: Request, res: Response) => {
         ...(tools ? { tools } : {}),
         ...(toolChoice ? { tool_choice: toolChoice as Anthropic.MessageCreateParams["tool_choice"] } : {}),
         ...(thinking ? { thinking } : {}),
-      };
+      });
 
       if (stream) {
         res.setHeader("Content-Type", "text/event-stream");
