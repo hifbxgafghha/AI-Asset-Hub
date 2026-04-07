@@ -475,6 +475,11 @@ function applyPromptCaching(
 function stripCacheControlScope(block: Record<string, unknown>): Record<string, unknown> {
   if (!block.cache_control || typeof block.cache_control !== "object") return block;
   const { scope: _scope, ...rest } = block.cache_control as Record<string, unknown>;
+  // If only scope was present, drop cache_control entirely to avoid sending {}
+  if (Object.keys(rest).length === 0) {
+    const { cache_control: _cc, ...blockWithout } = block;
+    return blockWithout;
+  }
   return { ...block, cache_control: rest };
 }
 
@@ -498,7 +503,17 @@ function stripScopeFromAnthropicParams(params: Anthropic.MessageCreateParams): A
     return msg;
   });
 
-  return { ...params, ...(cleanSystem !== undefined ? { system: cleanSystem } : {}), messages: cleanMessages };
+  // Also strip scope from tool definitions that carry cache_control
+  const cleanTools = params.tools
+    ? params.tools.map((t) => stripCacheControlScope(t as unknown as Record<string, unknown>) as unknown as Anthropic.Tool)
+    : params.tools;
+
+  return {
+    ...params,
+    ...(cleanSystem !== undefined ? { system: cleanSystem } : {}),
+    messages: cleanMessages,
+    ...(cleanTools !== undefined ? { tools: cleanTools } : {}),
+  };
 }
 
 // ─── Response conversion helpers ─────────────────────────────────────────────
@@ -743,7 +758,7 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
           for await (const event of anthropicStream) {
             if (event.type === "message_start") {
               messageId = event.message.id || messageId;
-              sendChunk({ role: "assistant", content: "", reasoning_content: "" });
+              sendChunk({ role: "assistant" });
             } else if (event.type === "content_block_start") {
               currentBlockIndex = event.index;
               const block = event.content_block;
@@ -781,7 +796,15 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
             } else if (event.type === "message_delta") {
               const stopReason =
                 event.delta.stop_reason === "tool_use" ? "tool_calls" : "stop";
-              sendChunk({}, stopReason);
+              const usageChunk: Record<string, unknown> = {};
+              if (event.usage) {
+                usageChunk.usage = {
+                  prompt_tokens: 0,
+                  completion_tokens: event.usage.output_tokens ?? 0,
+                  total_tokens: event.usage.output_tokens ?? 0,
+                };
+              }
+              sendChunk(usageChunk, stopReason);
             } else if (event.type === "message_stop") {
               res.write("data: [DONE]\n\n");
               flush();
